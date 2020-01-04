@@ -8,19 +8,21 @@ from .le import letvcloud_download_by_vu
 from .qq import qq_download_by_vid
 from .sina import sina_download_by_vid
 from .tudou import tudou_download_by_iid
-from .youku import youku_download_by_vid, youku_open_download_by_vid
+from .youku import youku_download_by_vid
 
 import json
 import re
 import base64
+import time
 
 def get_srt_json(id):
     url = 'http://danmu.aixifan.com/V2/%s' % id
     return get_content(url)
 
-def youku_acfun_proxy(vid, sign):
-    url = 'http://aplay-vod.cn-beijing.aliyuncs.com/acfun/web?vid={}&ct=85&ev=3&sign={}'.format(vid, sign)
-    json_data = json.loads(get_content(url))['data']
+def youku_acfun_proxy(vid, sign, ref):
+    endpoint = 'http://player.acfun.cn/flash_data?vid={}&ct=85&ev=3&sign={}&time={}'
+    url = endpoint.format(vid, sign, str(int(time.time() * 1000)))
+    json_data = json.loads(get_content(url, headers=dict(referer=ref)))['data']
     enc_text = base64.b64decode(json_data)
     dec_text = rc4(b'8bdc7e1a', enc_text).decode('utf8')
     youku_json = json.loads(dec_text)
@@ -47,7 +49,7 @@ def acfun_download_by_vid(vid, title, output_dir='.', merge=True, info_only=Fals
     """
 
     #first call the main parasing API
-    info = json.loads(get_content('http://www.acfun.tv/video/getVideo.aspx?id=' + vid))
+    info = json.loads(get_content('http://www.acfun.cn/video/getVideo.aspx?id=' + vid, headers=fake_headers))
 
     sourceType = info['sourceType']
 
@@ -63,14 +65,15 @@ def acfun_download_by_vid(vid, title, output_dir='.', merge=True, info_only=Fals
     elif sourceType == 'tudou':
         tudou_download_by_iid(sourceId, title, output_dir=output_dir, merge=merge, info_only=info_only)
     elif sourceType == 'qq':
-        qq_download_by_vid(sourceId, title, output_dir=output_dir, merge=merge, info_only=info_only)
+        qq_download_by_vid(sourceId, title, True, output_dir=output_dir, merge=merge, info_only=info_only)
     elif sourceType == 'letv':
         letvcloud_download_by_vu(sourceId, '2d8c027396', title, output_dir=output_dir, merge=merge, info_only=info_only)
     elif sourceType == 'zhuzhan':
         #As in Jul.28.2016, Acfun is using embsig to anti hotlink so we need to pass this
 #In Mar. 2017 there is a dedicated ``acfun_proxy'' in youku cloud player
 #old code removed
-        yk_streams = youku_acfun_proxy(info['sourceId'], info['encode'])
+        url = 'http://www.acfun.cn/v/ac' + vid
+        yk_streams = youku_acfun_proxy(info['sourceId'], info['encode'], url)
         seq = ['mp4hd3', 'mp4hd2', 'mp4hd', 'flvhd']
         for t in seq:
             if yk_streams.get(t):
@@ -82,9 +85,13 @@ def acfun_download_by_vid(vid, title, output_dir='.', merge=True, info_only=Fals
             _, _, seg_size = url_info(url)
             size += seg_size
 #fallback to flvhd is not quite possible
-        print_info(site_info, title, 'mp4', size)
+        if re.search(r'fid=[0-9A-Z\-]*.flv', preferred[0][0]):
+            ext = 'flv'
+        else:
+            ext = 'mp4'
+        print_info(site_info, title, ext, size)
         if not info_only:
-            download_urls(preferred[0], title, 'mp4', size, output_dir=output_dir, merge=merge)
+            download_urls(preferred[0], title, ext, size, output_dir=output_dir, merge=merge)
     else:
         raise NotImplementedError(sourceType)
 
@@ -102,25 +109,67 @@ def acfun_download_by_vid(vid, title, output_dir='.', merge=True, info_only=Fals
             pass
 
 def acfun_download(url, output_dir='.', merge=True, info_only=False, **kwargs):
-    assert re.match(r'http://[^\.]+.acfun.[^\.]+/\D/\D\D(\d+)', url)
-    html = get_content(url)
+    assert re.match(r'https?://[^\.]*\.*acfun\.[^\.]+/(\D|bangumi)/\D\D(\d+)', url)
 
-    title = r1(r'data-title="([^"]+)"', html)
+    if re.match(r'https?://[^\.]*\.*acfun\.[^\.]+/\D/\D\D(\d+)', url):
+        html = get_content(url, headers=fake_headers)
+        json_text = match1(html, r"(?s)videoInfo\s*=\s*(\{.*?\});")
+        json_data = json.loads(json_text)
+        vid = json_data.get('currentVideoInfo').get('id')
+        up = json_data.get('user').get('name')
+        title = json_data.get('title')
+        video_list = json_data.get('videoList')
+        if len(video_list) > 1:
+            title += " - " + [p.get('title') for p in video_list if p.get('id') == vid][0]
+        currentVideoInfo = json_data.get('currentVideoInfo')
+        if 'playInfos' in currentVideoInfo:
+            m3u8_url = currentVideoInfo['playInfos'][0]['playUrls'][0]
+        elif 'ksPlayJson' in currentVideoInfo:
+            ksPlayJson = json.loads( currentVideoInfo['ksPlayJson'] ) 
+            representation = ksPlayJson.get('adaptationSet').get('representation')
+            reps = []
+            for one in representation:
+                reps.append( (one['width']* one['height'], one['url'], one['backupUrl']) )
+            m3u8_url = max(reps)[1]
+            
+    elif re.match("https?://[^\.]*\.*acfun\.[^\.]+/bangumi/ab(\d+)", url):
+        html = get_content(url, headers=fake_headers)
+        tag_script = match1(html, r'<script>window\.pageInfo([^<]+)</script>')
+        json_text = tag_script[tag_script.find('{') : tag_script.find('};') + 1]
+        json_data = json.loads(json_text)
+        title = json_data['bangumiTitle'] + " " + json_data['episodeName'] + " " + json_data['title']
+        vid = str(json_data['videoId'])
+        up = "acfun"
+
+        play_info = get_content("https://www.acfun.cn/rest/pc-direct/play/playInfo/m3u8Auto?videoId=" + vid, headers=fake_headers)
+        play_url = json.loads(play_info)['playInfo']['streams'][0]['playUrls'][0]
+        m3u8_all_qualities_file = get_content(play_url)
+        m3u8_all_qualities_lines = m3u8_all_qualities_file.split('#EXT-X-STREAM-INF:')[1:]
+        highest_quality_line = m3u8_all_qualities_lines[0]
+        for line in m3u8_all_qualities_lines:
+            bandwith = int(match1(line, r'BANDWIDTH=(\d+)'))
+            if bandwith > int(match1(highest_quality_line, r'BANDWIDTH=(\d+)')):
+                highest_quality_line = line
+        #TODO: 应由用户指定清晰度
+        m3u8_url = match1(highest_quality_line, r'\n([^#\n]+)$')
+        m3u8_url = play_url[:play_url.rfind("/")+1] + m3u8_url
+
+    else:
+        raise NotImplemented
+
+    assert title and m3u8_url
     title = unescape_html(title)
     title = escape_file_path(title)
-    assert title
-    if match1(url, r'_(\d+)$'): # current P
-        title = title + " " + r1(r'active">([^<]*)', html)
+    p_title = r1('active">([^<]+)', html)
+    title = '%s (%s)' % (title, up)
+    if p_title:
+        title = '%s - %s' % (title, p_title)
 
-    vid = r1('data-vid="(\d+)"', html)
-    up = r1('data-name="([^"]+)"', html)
-    title = title + ' - ' + up
-    acfun_download_by_vid(vid, title,
-                          output_dir=output_dir,
-                          merge=merge,
-                          info_only=info_only,
-                          **kwargs)
+    print_info(site_info, title, 'm3u8', float('inf'))
+    if not info_only:
+        download_url_ffmpeg(m3u8_url, title, 'mp4', output_dir=output_dir, merge=merge)
 
-site_info = "AcFun.tv"
+
+site_info = "AcFun.cn"
 download = acfun_download
 download_playlist = playlist_not_supported('acfun')
